@@ -19,6 +19,7 @@ package org.apache.flink.cdc.connectors.mysql.table;
 
 import org.apache.flink.cdc.connectors.mysql.MySqlValidatorTest;
 import org.apache.flink.cdc.connectors.mysql.testutils.MySqlContainer;
+import org.apache.flink.cdc.connectors.mysql.testutils.MySqlVersion;
 import org.apache.flink.cdc.connectors.mysql.testutils.UniqueDatabase;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.EnvironmentSettings;
@@ -27,11 +28,9 @@ import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 
-import org.junit.Before;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
+import org.assertj.core.api.Assumptions;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
@@ -52,18 +51,16 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Random;
-import java.util.UUID;
 import java.util.stream.Stream;
 
 import static org.apache.flink.cdc.connectors.mysql.source.MySqlSourceTestBase.assertEqualsInAnyOrder;
 import static org.apache.flink.cdc.connectors.mysql.source.MySqlSourceTestBase.assertEqualsInOrder;
 
 /** Integration tests to check mysql-cdc works well under different MySQL server timezone. */
-@RunWith(Parameterized.class)
-public class MySqlTimezoneITCase {
+class MySqlTimezoneITCase {
 
     private static final Logger LOG = LoggerFactory.getLogger(MySqlTimezoneITCase.class);
-    private static TemporaryFolder tempFolder;
+    private Path tempFolder;
     private static File resourceFolder;
     private final StreamExecutionEnvironment env =
             StreamExecutionEnvironment.getExecutionEnvironment();
@@ -71,15 +68,12 @@ public class MySqlTimezoneITCase {
             StreamTableEnvironment.create(
                     env, EnvironmentSettings.newInstance().inStreamingMode().build());
 
-    @Parameterized.Parameter public Boolean incrementalSnapshot;
+    public void setup(boolean incrementalSnapshot) throws Exception {
+        // Non-incremental snapshot version does not support MySQL > 8.0.x
+        if (!incrementalSnapshot) {
+            Assumptions.assumeThat(MySqlVersion.CURRENT).isLessThanOrEqualTo(MySqlVersion.V8_0);
+        }
 
-    @Parameterized.Parameters(name = "incrementalSnapshot: {0}")
-    public static List<Boolean> parameters() {
-        return Arrays.asList(true, false);
-    }
-
-    @Before
-    public void setup() throws Exception {
         resourceFolder =
                 Paths.get(
                                 Objects.requireNonNull(
@@ -88,32 +82,37 @@ public class MySqlTimezoneITCase {
                                                         .getResource("."))
                                         .toURI())
                         .toFile();
-        tempFolder = new TemporaryFolder(resourceFolder);
-        tempFolder.create();
         if (incrementalSnapshot) {
             env.setParallelism(4);
             env.enableCheckpointing(200);
         } else {
             env.setParallelism(1);
         }
+        tempFolder = Files.createTempDirectory(resourceFolder.toPath(), "mysql-config");
     }
 
-    @Test
-    public void testMySqlServerInBerlin() throws Exception {
-        testTemporalTypesWithMySqlServerTimezone("Europe/Berlin");
+    @ParameterizedTest(name = "incrementalSnapshot: {0}")
+    @ValueSource(booleans = {true, false})
+    void testMySqlServerInBerlin(boolean incrementalSnapshot) throws Exception {
+        setup(incrementalSnapshot);
+        testTemporalTypesWithMySqlServerTimezone("Europe/Berlin", incrementalSnapshot);
     }
 
-    @Test
-    public void testMySqlServerInShanghai() throws Exception {
-        testTemporalTypesWithMySqlServerTimezone("Asia/Shanghai");
+    @ParameterizedTest(name = "incrementalSnapshot: {0}")
+    @ValueSource(booleans = {true, false})
+    void testMySqlServerInShanghai(boolean incrementalSnapshot) throws Exception {
+        setup(incrementalSnapshot);
+        testTemporalTypesWithMySqlServerTimezone("Asia/Shanghai", incrementalSnapshot);
     }
 
-    private void testTemporalTypesWithMySqlServerTimezone(String timezone) throws Exception {
+    private void testTemporalTypesWithMySqlServerTimezone(
+            String timezone, boolean incrementalSnapshot) throws Exception {
         MySqlContainer mySqlContainer =
                 (MySqlContainer)
                         new MySqlContainer()
-                                .withConfigurationOverride(buildMySqlConfigWithTimezone(timezone))
-                                .withSetupSQL("docker/setup.sql")
+                                .withRawConfigurationOverride(
+                                        buildMySqlConfigWithTimezone(timezone))
+                                .withSetupSQL("setup.sql")
                                 .withDatabaseName("flink-test")
                                 .withUsername("flinkuser")
                                 .withPassword("flinkpw")
@@ -173,8 +172,8 @@ public class MySqlTimezoneITCase {
                         fullTypesDatabase.getDatabaseName(),
                         "full_types",
                         incrementalSnapshot,
-                        getServerId(),
-                        getSplitSize(),
+                        getServerId(incrementalSnapshot),
+                        getSplitSize(incrementalSnapshot),
                         timezone);
         tEnv.executeSql(sourceDDL);
 
@@ -211,7 +210,7 @@ public class MySqlTimezoneITCase {
         mySqlContainer.stop();
     }
 
-    private String getServerId() {
+    private String getServerId(boolean incrementalSnapshot) {
         final Random random = new Random();
         int serverId = random.nextInt(100) + 5400;
         if (incrementalSnapshot) {
@@ -220,7 +219,7 @@ public class MySqlTimezoneITCase {
         return String.valueOf(serverId);
     }
 
-    private int getSplitSize() {
+    private int getSplitSize(boolean incrementalSnapshot) {
         if (incrementalSnapshot) {
             // test parallel read
             return 4;
@@ -253,8 +252,7 @@ public class MySqlTimezoneITCase {
         }
 
         try {
-            File folder = tempFolder.newFolder(String.valueOf(UUID.randomUUID()));
-            Path cnf = Files.createFile(Paths.get(folder.getPath(), "my.cnf"));
+            Path cnf = Files.createFile(Paths.get(tempFolder.toString(), "my.cnf"));
             String mysqldConf =
                     "[mysqld]\n"
                             + "binlog_format = row\n"

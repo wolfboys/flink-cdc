@@ -46,8 +46,6 @@ import org.apache.flink.cdc.common.utils.Preconditions;
 import org.apache.flink.cdc.connectors.mysql.factory.MySqlDataSourceFactory;
 import org.apache.flink.cdc.connectors.mysql.source.config.MySqlSourceConfigFactory;
 import org.apache.flink.cdc.connectors.mysql.table.StartupOptions;
-import org.apache.flink.cdc.connectors.mysql.testutils.MySqlContainer;
-import org.apache.flink.cdc.connectors.mysql.testutils.MySqlVersion;
 import org.apache.flink.cdc.connectors.mysql.testutils.UniqueDatabase;
 import org.apache.flink.cdc.runtime.typeutils.BinaryRecordDataGenerator;
 import org.apache.flink.cdc.runtime.typeutils.EventTypeInfo;
@@ -55,10 +53,10 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.planner.factories.TestValuesTableFactory;
 import org.apache.flink.util.CloseableIterator;
 
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.testcontainers.lifecycle.Startables;
 
 import java.sql.Connection;
@@ -87,36 +85,32 @@ import static org.apache.flink.cdc.connectors.mysql.source.MySqlDataSourceOption
 import static org.apache.flink.cdc.connectors.mysql.testutils.MySqSourceTestUtils.TEST_PASSWORD;
 import static org.apache.flink.cdc.connectors.mysql.testutils.MySqSourceTestUtils.TEST_USER;
 import static org.apache.flink.cdc.connectors.mysql.testutils.MySqSourceTestUtils.fetchResults;
-import static org.apache.flink.cdc.connectors.mysql.testutils.MySqSourceTestUtils.getServerId;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** IT tests for {@link MySqlDataSource}. */
-public class MySqlPipelineITCase extends MySqlSourceTestBase {
-
-    protected static final MySqlContainer MYSQL8_CONTAINER =
-            createMySqlContainer(MySqlVersion.V8_0);
+class MySqlPipelineITCase extends MySqlSourceTestBase {
 
     private final UniqueDatabase inventoryDatabase =
-            new UniqueDatabase(MYSQL8_CONTAINER, "inventory", TEST_USER, TEST_PASSWORD);
+            new UniqueDatabase(MYSQL_CONTAINER, "inventory", TEST_USER, TEST_PASSWORD);
 
     private final StreamExecutionEnvironment env =
             StreamExecutionEnvironment.getExecutionEnvironment();
 
-    @BeforeClass
+    @BeforeAll
     public static void startContainers() {
         LOG.info("Starting containers...");
-        Startables.deepStart(Stream.of(MYSQL8_CONTAINER)).join();
+        Startables.deepStart(Stream.of(MYSQL_CONTAINER)).join();
         LOG.info("Containers are started.");
     }
 
-    @AfterClass
+    @AfterAll
     public static void stopContainers() {
         LOG.info("Stopping containers...");
-        MYSQL8_CONTAINER.stop();
+        MYSQL_CONTAINER.stop();
         LOG.info("Containers are stopped.");
     }
 
-    @Before
+    @BeforeEach
     public void before() {
         TestValuesTableFactory.clearAllData();
         env.setParallelism(4);
@@ -125,12 +119,12 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
     }
 
     @Test
-    public void testInitialStartupMode() throws Exception {
+    void testInitialStartupMode() throws Exception {
         inventoryDatabase.createAndInitialize();
         MySqlSourceConfigFactory configFactory =
                 new MySqlSourceConfigFactory()
-                        .hostname(MYSQL8_CONTAINER.getHost())
-                        .port(MYSQL8_CONTAINER.getDatabasePort())
+                        .hostname(MYSQL_CONTAINER.getHost())
+                        .port(MYSQL_CONTAINER.getDatabasePort())
                         .username(TEST_USER)
                         .password(TEST_PASSWORD)
                         .databaseList(inventoryDatabase.getDatabaseName())
@@ -255,6 +249,149 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
                 .isEqualTo(expectedBinlog);
     }
 
+    @Test
+    void testExcludeTables() throws Exception {
+        inventoryDatabase.createAndInitialize();
+        String databaseName = inventoryDatabase.getDatabaseName();
+        MySqlSourceConfigFactory configFactory =
+                new MySqlSourceConfigFactory()
+                        .hostname(MYSQL_CONTAINER.getHost())
+                        .port(MYSQL_CONTAINER.getDatabasePort())
+                        .username(TEST_USER)
+                        .password(TEST_PASSWORD)
+                        .databaseList(databaseName)
+                        .tableList(databaseName + ".*")
+                        .excludeTableList(
+                                String.format(
+                                        "%s.customers, %s.orders, %s.multi_max_table",
+                                        databaseName, databaseName, databaseName))
+                        .startupOptions(StartupOptions.initial())
+                        .serverId(getServerId(env.getParallelism()))
+                        .serverTimeZone("UTC")
+                        .includeSchemaChanges(SCHEMA_CHANGE_ENABLED.defaultValue());
+
+        FlinkSourceProvider sourceProvider =
+                (FlinkSourceProvider) new MySqlDataSource(configFactory).getEventSourceProvider();
+        CloseableIterator<Event> events =
+                env.fromSource(
+                                sourceProvider.getSource(),
+                                WatermarkStrategy.noWatermarks(),
+                                MySqlDataSourceFactory.IDENTIFIER,
+                                new EventTypeInfo())
+                        .executeAndCollect();
+        Thread.sleep(10_000);
+
+        TableId tableId = TableId.tableId(databaseName, "products");
+        CreateTableEvent createTableEvent = getProductsCreateTableEvent(tableId);
+
+        // generate snapshot data
+        List<Event> expectedSnapshot = getSnapshotExpected(tableId);
+
+        List<Event> expectedBinlog = new ArrayList<>();
+        try (Connection connection = inventoryDatabase.getJdbcConnection();
+                Statement statement = connection.createStatement()) {
+            expectedBinlog.addAll(executeAlterAndProvideExpected(tableId, statement));
+
+            RowType rowType =
+                    RowType.of(
+                            new DataType[] {
+                                DataTypes.INT().notNull(),
+                                DataTypes.VARCHAR(255).notNull(),
+                                DataTypes.FLOAT(),
+                                DataTypes.VARCHAR(45),
+                                DataTypes.VARCHAR(55)
+                            },
+                            new String[] {"id", "name", "weight", "col1", "col2"});
+            BinaryRecordDataGenerator generator = new BinaryRecordDataGenerator(rowType);
+            // insert more data
+            statement.execute(
+                    String.format(
+                            "INSERT INTO `%s`.`products` VALUES (default,'scooter',5.5,'c-10','c-20');",
+                            databaseName)); // 110
+            expectedBinlog.add(
+                    DataChangeEvent.insertEvent(
+                            tableId,
+                            generator.generate(
+                                    new Object[] {
+                                        110,
+                                        BinaryStringData.fromString("scooter"),
+                                        5.5f,
+                                        BinaryStringData.fromString("c-10"),
+                                        BinaryStringData.fromString("c-20")
+                                    })));
+            statement.execute(
+                    String.format(
+                            "INSERT INTO `%s`.`products` VALUES (default,'football',6.6,'c-11','c-21');",
+                            databaseName)); // 111
+            expectedBinlog.add(
+                    DataChangeEvent.insertEvent(
+                            tableId,
+                            generator.generate(
+                                    new Object[] {
+                                        111,
+                                        BinaryStringData.fromString("football"),
+                                        6.6f,
+                                        BinaryStringData.fromString("c-11"),
+                                        BinaryStringData.fromString("c-21")
+                                    })));
+            statement.execute(
+                    String.format(
+                            "UPDATE `%s`.`products` SET `col1`='c-12', `col2`='c-22' WHERE id=110;",
+                            databaseName));
+            expectedBinlog.add(
+                    DataChangeEvent.updateEvent(
+                            tableId,
+                            generator.generate(
+                                    new Object[] {
+                                        110,
+                                        BinaryStringData.fromString("scooter"),
+                                        5.5f,
+                                        BinaryStringData.fromString("c-10"),
+                                        BinaryStringData.fromString("c-20")
+                                    }),
+                            generator.generate(
+                                    new Object[] {
+                                        110,
+                                        BinaryStringData.fromString("scooter"),
+                                        5.5f,
+                                        BinaryStringData.fromString("c-12"),
+                                        BinaryStringData.fromString("c-22")
+                                    })));
+            statement.execute(
+                    String.format("DELETE FROM `%s`.`products` WHERE `id` = 111;", databaseName));
+            expectedBinlog.add(
+                    DataChangeEvent.deleteEvent(
+                            tableId,
+                            generator.generate(
+                                    new Object[] {
+                                        111,
+                                        BinaryStringData.fromString("football"),
+                                        6.6f,
+                                        BinaryStringData.fromString("c-11"),
+                                        BinaryStringData.fromString("c-21")
+                                    })));
+            // Make some change of excluded tables.
+            statement.execute(
+                    String.format(
+                            "INSERT INTO `%s`.`customers` VALUES(1,\"Anne\",\"Kretchmar\",\"mark@noanswer.org\");",
+                            databaseName));
+            statement.execute(
+                    String.format(
+                            "INSERT INTO `%s`.`customers` VALUES(2,\"Anne\",\"Kretchmar\",\"mark2@noanswer.org\");",
+                            databaseName));
+        }
+        // In this configuration, several subtasks might emit their corresponding CreateTableEvent
+        // to downstream. Since it is not possible to predict how many CreateTableEvents should we
+        // expect, we simply filter them out from expected sets, and assert there's at least one.
+        List<Event> actual =
+                fetchResultsExcept(
+                        events, expectedSnapshot.size() + expectedBinlog.size(), createTableEvent);
+        assertThat(actual.subList(0, expectedSnapshot.size()))
+                .containsExactlyInAnyOrder(expectedSnapshot.toArray(new Event[0]));
+        assertThat(actual.subList(expectedSnapshot.size(), actual.size()))
+                .isEqualTo(expectedBinlog);
+    }
+
     private static <T> List<T> fetchResultsExcept(Iterator<T> iter, int size, T sideEvent) {
         List<T> result = new ArrayList<>(size);
         List<T> sideResults = new ArrayList<>();
@@ -283,11 +420,11 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
     }
 
     @Test
-    public void testInitialStartupModeWithOpTs() throws Exception {
+    void testInitialStartupModeWithOpTs() throws Exception {
         inventoryDatabase.createAndInitialize();
         Configuration sourceConfiguration = new Configuration();
-        sourceConfiguration.set(MySqlDataSourceOptions.HOSTNAME, MYSQL8_CONTAINER.getHost());
-        sourceConfiguration.set(MySqlDataSourceOptions.PORT, MYSQL8_CONTAINER.getDatabasePort());
+        sourceConfiguration.set(MySqlDataSourceOptions.HOSTNAME, MYSQL_CONTAINER.getHost());
+        sourceConfiguration.set(MySqlDataSourceOptions.PORT, MYSQL_CONTAINER.getDatabasePort());
         sourceConfiguration.set(MySqlDataSourceOptions.USERNAME, TEST_USER);
         sourceConfiguration.set(MySqlDataSourceOptions.PASSWORD, TEST_PASSWORD);
         sourceConfiguration.set(
@@ -444,14 +581,14 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
         }
     }
 
-    public void testParseAlterStatement(boolean tinyInt1isBit) throws Exception {
+    private void testParseAlterStatement(boolean tinyInt1isBit) throws Exception {
         env.setParallelism(1);
         inventoryDatabase.createAndInitialize();
 
         MySqlSourceConfigFactory configFactory =
                 new MySqlSourceConfigFactory()
-                        .hostname(MYSQL8_CONTAINER.getHost())
-                        .port(MYSQL8_CONTAINER.getDatabasePort())
+                        .hostname(MYSQL_CONTAINER.getHost())
+                        .port(MYSQL_CONTAINER.getDatabasePort())
                         .username(TEST_USER)
                         .password(TEST_PASSWORD)
                         .databaseList(inventoryDatabase.getDatabaseName())
@@ -596,7 +733,7 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
     }
 
     @Test
-    public void testSchemaChangeEventstinyInt1isBit() throws Exception {
+    void testSchemaChangeEventstinyInt1isBit() throws Exception {
         testSchemaChangeEvents(true);
     }
 
@@ -611,8 +748,8 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
 
         MySqlSourceConfigFactory configFactory =
                 new MySqlSourceConfigFactory()
-                        .hostname(MYSQL8_CONTAINER.getHost())
-                        .port(MYSQL8_CONTAINER.getDatabasePort())
+                        .hostname(MYSQL_CONTAINER.getHost())
+                        .port(MYSQL_CONTAINER.getDatabasePort())
                         .username(TEST_USER)
                         .password(TEST_PASSWORD)
                         .databaseList(inventoryDatabase.getDatabaseName())
@@ -966,7 +1103,7 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
     }
 
     @Test
-    public void testDanglingDropTableEventInBinlog() throws Exception {
+    void testDanglingDropTableEventInBinlog() throws Exception {
         env.setParallelism(1);
         inventoryDatabase.createAndInitialize();
 
@@ -1001,8 +1138,8 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
 
         MySqlSourceConfigFactory configFactory =
                 new MySqlSourceConfigFactory()
-                        .hostname(MYSQL8_CONTAINER.getHost())
-                        .port(MYSQL8_CONTAINER.getDatabasePort())
+                        .hostname(MYSQL_CONTAINER.getHost())
+                        .port(MYSQL_CONTAINER.getDatabasePort())
                         .username(TEST_USER)
                         .password(TEST_PASSWORD)
                         .databaseList(inventoryDatabase.getDatabaseName())
@@ -1054,8 +1191,8 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
         executeSql(inventoryDatabase, createTableSql);
 
         Map<String, String> options = new HashMap<>();
-        options.put(HOSTNAME.key(), MYSQL8_CONTAINER.getHost());
-        options.put(PORT.key(), String.valueOf(MYSQL8_CONTAINER.getDatabasePort()));
+        options.put(HOSTNAME.key(), MYSQL_CONTAINER.getHost());
+        options.put(PORT.key(), String.valueOf(MYSQL_CONTAINER.getDatabasePort()));
         options.put(USERNAME.key(), TEST_USER);
         options.put(PASSWORD.key(), TEST_PASSWORD);
         options.put(SERVER_TIME_ZONE.key(), "UTC");
@@ -1102,8 +1239,8 @@ public class MySqlPipelineITCase extends MySqlSourceTestBase {
                 TableId.tableId(inventoryDatabase.getDatabaseName(), "products_with_comments2");
 
         Map<String, String> options = new HashMap<>();
-        options.put(HOSTNAME.key(), MYSQL8_CONTAINER.getHost());
-        options.put(PORT.key(), String.valueOf(MYSQL8_CONTAINER.getDatabasePort()));
+        options.put(HOSTNAME.key(), MYSQL_CONTAINER.getHost());
+        options.put(PORT.key(), String.valueOf(MYSQL_CONTAINER.getDatabasePort()));
         options.put(USERNAME.key(), TEST_USER);
         options.put(PASSWORD.key(), TEST_PASSWORD);
         options.put(SERVER_TIME_ZONE.key(), "UTC");
